@@ -1,0 +1,30 @@
+name: Weekly Donate DouYu Gifts
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: 
+  schedule:
+    # 北京时间每周日晚上 23:00 (UTC 15:00)
+    - cron: '0 15 * * 0'
+
+jobs:
+  dy_auto_donate_helper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v2
+      - name: 'Set up Python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: 'Install requirements'
+        run: pip install -r requirements.txt
+      - name: 'Working'
+        env:
+          SERVERPUSHKEY: ${{ secrets.SERVERPUSHKEY }}
+          COOKIES: ${{ secrets.COOKIES }}
+          BARKURL: ${{ secrets.BARKURL }}
+        run: |
+          python main.py
