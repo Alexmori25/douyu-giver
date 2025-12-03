@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Douyu-Helper Cookie 同步助手 (万能文件版)
+// @name         Douyu-Helper Cookie 同步助手 (轻量版)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
-// @description  支持自动读取(尝试绕过HttpOnly)或手动粘贴 Cookie，上传到 GitHub 文件。
+// @version      4.3
+// @description  自动/手动同步 Cookie 到 GitHub 文件。每天自动检查一次。UI 更轻量。
 // @author       DouyuHelperUser
 // @match        https://www.douyu.com/*
 // @grant        GM_xmlhttpRequest
@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_cookie
+// @grant        GM_notification
 // @connect      api.github.com
 // ==/UserScript==
 
@@ -17,27 +18,51 @@
     'use strict';
 
     const COOKIE_FILE_PATH = '.github/douyu_cookie.txt';
+    const AUTO_SYNC_INTERVAL_HOURS = 24; // 每 24 小时自动同步一次
 
     function utf8_to_b64(str) {
         return window.btoa(unescape(encodeURIComponent(str)));
     }
 
-    function showOverlay(message, type = 'info', duration = 0) {
-        const old = document.getElementById('dy-helper-overlay');
+    // 轻量级提示 (右下角小卡片)
+    function showToast(message, type = 'info', duration = 3000) {
+        const old = document.getElementById('dy-helper-toast');
         if (old) old.remove();
-        const overlay = document.createElement('div');
-        overlay.id = 'dy-helper-overlay';
-        let bgColor = 'rgba(0, 0, 0, 0.85)';
-        if (type === 'success') bgColor = 'rgba(46, 125, 50, 0.9)';
-        if (type === 'error') bgColor = 'rgba(183, 28, 28, 0.9)';
-        overlay.style.cssText = `position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: ${bgColor}; z-index: 2147483647; display: flex; flex-direction: column; justify-content: center; align-items: center; color: white; font-family: "Microsoft YaHei", sans-serif; text-align: center; pointer-events: auto;`;
-        overlay.innerHTML = `<div style="font-size: 48px; font-weight: bold; margin-bottom: 20px;">🔄 Douyu Helper</div><div style="font-size: 32px; padding: 20px; border: 3px solid white; border-radius: 10px; max-width: 80vw;">${message}</div><div style="margin-top: 30px; font-size: 18px; color: #ddd;">(点击任意处关闭)</div>`;
-        overlay.onclick = () => overlay.remove();
-        document.body.appendChild(overlay);
-        if (duration > 0) setTimeout(() => { if (document.body.contains(overlay)) overlay.remove(); }, duration);
+
+        const toast = document.createElement('div');
+        toast.id = 'dy-helper-toast';
+        let bg = '#333';
+        let icon = 'ℹ️';
+        
+        if (type === 'success') { bg = '#4caf50'; icon = '✅'; }
+        if (type === 'error') { bg = '#f44336'; icon = '❌'; }
+
+        toast.style.cssText = `
+            position: fixed; bottom: 20px; right: 20px; z-index: 10000;
+            background: ${bg}; color: white; padding: 12px 20px;
+            border-radius: 8px; font-family: sans-serif; font-size: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3); display: flex; align-items: center;
+            transition: opacity 0.3s, transform 0.3s; opacity: 0; transform: translateY(20px);
+        `;
+        toast.innerHTML = `<span style="margin-right: 8px; font-size: 18px;">${icon}</span> ${message}`;
+        
+        document.body.appendChild(toast);
+        
+        // 动画入场
+        requestAnimationFrame(() => {
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateY(0)';
+        });
+
+        if (duration > 0) {
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(20px)';
+                setTimeout(() => toast.remove(), 300);
+            }, duration);
+        }
     }
 
-    // 尝试获取所有 Cookie (包括 HttpOnly)
     function getAllCookies() {
         return new Promise((resolve) => {
             if (typeof GM_cookie !== 'undefined') {
@@ -45,7 +70,7 @@
                     if (!error && cookies) {
                         resolve(cookies.map(c => `${c.name}=${c.value}`).join('; '));
                     } else {
-                        resolve(document.cookie); // 降级
+                        resolve(document.cookie);
                     }
                 });
             } else {
@@ -72,7 +97,7 @@
     function putFile(token, repo, path, content, sha) {
         return new Promise((resolve, reject) => {
             const body = {
-                message: 'update douyu cookie [skip ci]',
+                message: 'chore: auto update cookie [skip ci]',
                 content: content,
                 sha: sha
             };
@@ -81,41 +106,52 @@
                 url: `https://api.github.com/repos/${repo}/contents/${path}`,
                 headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
                 data: JSON.stringify(body),
-                onload: r => (r.status === 201 || r.status === 200) ? resolve() : reject(new Error(`上传失败 ${r.status}: ${r.responseText}`)),
-                onerror: () => reject(new Error('网络错误'))
+                onload: r => (r.status === 201 || r.status === 200) ? resolve() : reject(new Error(`code ${r.status}`)),
+                onerror: () => reject(new Error('network error'))
             });
         });
     }
 
-    async function runSync(manualCookie = null) {
+    async function runSync(manualCookie = null, isAuto = false) {
         const token = GM_getValue('gh_token');
         const repo = GM_getValue('gh_repo');
+        
+        // 如果是自动运行且没配置，直接静默退出
+        if ((!token || !repo) && isAuto) return;
         if (!token || !repo) { setupConfig(); return; }
 
-        showOverlay('正在处理 Cookie...', 'info');
+        // 自动运行频率检查
+        if (isAuto) {
+            const lastSync = GM_getValue('last_sync_time', 0);
+            const hoursSince = (Date.now() - lastSync) / (1000 * 3600);
+            if (hoursSince < AUTO_SYNC_INTERVAL_HOURS) {
+                console.log(`[DouyuHelper] Skip auto sync. Last sync: ${hoursSince.toFixed(1)}h ago.`);
+                return;
+            }
+        }
+
+        if (!isAuto) showToast('正在同步...', 'info', 0);
 
         try {
             let finalCookie = manualCookie;
-            
-            if (!finalCookie) {
-                finalCookie = await getAllCookies();
-            }
+            if (!finalCookie) finalCookie = await getAllCookies();
 
-            // 放宽检查：只要有 acf_uid 就算登录 (acf_auth 可能是 HttpOnly 读不到)
             if (!finalCookie.includes('acf_uid') && !finalCookie.includes('acf_auth')) {
-                 throw new Error('未检测到登录信息 (acf_uid/acf_auth 缺失)。\n请尝试"手动粘贴 Cookie"功能。');
+                 throw new Error('未检测到登录');
             }
-
-            showOverlay('正在上传 Cookie 文件...', 'info');
             
             const content = utf8_to_b64(finalCookie);
             const sha = await getFileSha(token, repo, COOKIE_FILE_PATH);
             await putFile(token, repo, COOKIE_FILE_PATH, content, sha);
 
-            showOverlay('同步成功！<br>Cookie 已更新', 'success', 3000);
+            // 记录成功时间
+            GM_setValue('last_sync_time', Date.now());
+
+            showToast('Cookie 已同步到 GitHub', 'success', 3000);
         } catch (e) {
             console.error(e);
-            showOverlay(`失败: ${e.message}`, 'error');
+            // 自动运行失败不弹窗打扰，除非是严重错误
+            if (!isAuto) showToast(`同步失败: ${e.message}`, 'error', 5000);
         }
     }
 
@@ -126,21 +162,19 @@
         if (!r) return;
         GM_setValue('gh_token', t);
         GM_setValue('gh_repo', r);
-        runSync();
+        runSync(null, false); // 手动触发一次
     }
 
     function manualPaste() {
-        const c = prompt('请粘贴 F12 获取的完整 Cookie 字符串:');
-        if (c && c.trim()) {
-            runSync(c.trim());
-        }
+        const c = prompt('请粘贴 Cookie:');
+        if (c && c.trim()) runSync(c.trim(), false);
     }
 
-    GM_registerMenuCommand("🚀 自动同步 Cookie", () => runSync());
-    GM_registerMenuCommand("📋 手动粘贴 Cookie 并上传", manualPaste);
-    GM_registerMenuCommand("⚙️ 设置 GitHub 信息", setupConfig);
+    GM_registerMenuCommand("🚀 立即同步", () => runSync(null, false));
+    GM_registerMenuCommand("📋 手动粘贴 Cookie", manualPaste);
+    GM_registerMenuCommand("⚙️ 设置", setupConfig);
     
-    // 延时自动尝试
-    setTimeout(() => runSync(), 5000);
+    // 启动后延迟 5s 检查是否需要自动同步
+    setTimeout(() => runSync(null, true), 5000);
 
 })();
