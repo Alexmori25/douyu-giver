@@ -2,7 +2,7 @@
 // @name             斗鱼全民星推荐自动领取max
 // @namespace        http://tampermonkey.net/
 // @version          1.0
-// @author           ienone&Truthss
+// @author           yqqxy
 // @description      斗鱼全民星推荐自动领取pro版的基础上加上了红包筛选
 // @license          MIT
 // @match            *://www.douyu.com/*
